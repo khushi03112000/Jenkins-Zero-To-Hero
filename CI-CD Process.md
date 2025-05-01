@@ -139,3 +139,203 @@ stage('Push Docker Image') {
 - **Packaging the JAR (Stage 5)** is only done **after** these checks to ensure that you have a working and clean codebase ready for deployment.
 
 ---
+
+Great! Let’s walk through the **Complete CD (Continuous Deployment) process** where:
+
+- You have **Jenkins running on EC2-1**.
+- You have a **Kubernetes cluster running on EC2-2**.
+- Your app is **already containerized** (Docker image pushed to DockerHub from the CI process).
+- Jenkins will trigger a deployment on Kubernetes using **`kubeconfig`**.
+
+---
+
+## ✅ Overview of What You’ll Do
+
+1. **Push Docker image to DockerHub** (already done in CI).
+2. **Setup K8s cluster on EC2-2**.
+3. **Expose K8s API Server** on EC2-2 to allow Jenkins to access it.
+4. **Generate and copy kubeconfig file** from EC2-2 to EC2-1 (Jenkins).
+5. **Add kubeconfig as Jenkins credentials**.
+6. **Jenkinsfile** will use the kubeconfig to run `kubectl apply -f deployment.yaml`.
+
+---
+
+## 🔍 Step-by-Step Explanation
+
+### 🧠 What is `kubeconfig`?
+
+- `kubeconfig` is a file that contains **connection details**, **certificates**, and **auth tokens** to access a Kubernetes cluster.
+- It allows `kubectl` to connect and authenticate to the Kubernetes **API server**.
+- Default location: `~/.kube/config`
+
+---
+
+## 🔧 Step-by-Step: CD with Jenkins + K8s (on separate EC2s)
+
+---
+
+### ✅ 1. Create Kubernetes Cluster on EC2-2
+
+You can use `kubeadm` for a minimal setup:
+```bash
+sudo apt-get update
+sudo apt-get install -y docker.io
+sudo systemctl enable docker && sudo systemctl start docker
+sudo apt-get install -y apt-transport-https curl
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt update
+sudo apt install -y kubelet kubeadm kubectl
+sudo kubeadm init --pod-network-cidr=192.168.0.0/16
+```
+
+Post init:
+```bash
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+Install pod network:
+```bash
+kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+```
+
+✅ Now Kubernetes is running on EC2-2.
+
+---
+
+### ✅ 2. Expose the Kubernetes API server (EC2-2)
+
+By default, API server listens on `127.0.0.1`. You need to change it to listen on **external IP**.
+
+1. Edit Kubernetes API server manifest:
+```bash
+sudo nano /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+2. Look for `--advertise-address=127.0.0.1`, change to:
+```yaml
+--advertise-address=<EC2-2-private-or-public-IP>
+```
+
+3. Also make sure EC2-2's security group allows **port 6443** inbound from EC2-1 (Jenkins node).
+
+Then reboot kubelet:
+```bash
+sudo systemctl restart kubelet
+```
+
+---
+
+### ✅ 3. Copy kubeconfig to EC2-1 (Jenkins)
+
+From EC2-2 (K8s node):
+```bash
+scp ~/.kube/config ubuntu@<EC2-1-PUBLIC-IP>:/home/ubuntu/kubeconfig
+```
+
+Now EC2-1 has `kubeconfig`.
+
+You can verify from EC2-1:
+```bash
+KUBECONFIG=/home/ubuntu/kubeconfig kubectl get nodes
+```
+
+If successful, Jenkins can use this file.
+
+---
+
+### ✅ 4. Add `kubeconfig` as Jenkins Credentials
+
+1. Go to **Jenkins → Manage Jenkins → Credentials**.
+2. Choose (global) → Add Credentials.
+3. Type: **Secret file**
+4. Upload the `/home/ubuntu/kubeconfig` file.
+5. ID: `kubeconfig`
+
+---
+
+### ✅ 5. Jenkinsfile for CD (Deployment to K8s)
+
+Your `Jenkinsfile` should have a deployment stage like:
+
+```groovy
+pipeline {
+  agent any
+
+  environment {
+    KUBECONFIG_CRED = credentials('kubeconfig')
+    IMAGE_NAME = 'khushi0311/simple-springboot-app'
+  }
+
+  stages {
+    stage('Deploy to K8s') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+          sh '''
+            echo "Deploying to Kubernetes"
+            export KUBECONFIG=$KUBECONFIG
+
+            kubectl set image deployment/my-app my-app=$IMAGE_NAME --namespace=default || \
+            kubectl apply -f k8s/deployment.yaml
+          '''
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+## ✅ Your `k8s/deployment.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: my-app
+        image: khushi0311/simple-springboot-app
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app-service
+spec:
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: LoadBalancer
+```
+
+---
+
+### ✅ Summary
+
+| Step | Action |
+|------|--------|
+| 1 | Jenkins builds & pushes Docker image to DockerHub |
+| 2 | K8s is running on EC2-2 and exposes its API |
+| 3 | EC2-1 (Jenkins) uses `kubeconfig` to talk to K8s |
+| 4 | Jenkins CD stage deploys Docker image to Kubernetes using `kubectl` |
+| 5 | Jenkins uses credentials to safely access the kubeconfig file |
+
+---
+
